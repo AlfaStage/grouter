@@ -10,6 +10,29 @@
 **Universal AI router — OAuth + API Key providers behind one OpenAI-compatible endpoint.**
 Run Claude Code, GitHub Copilot, Gemini CLI, Kiro, Kimi, KiloCode, Cursor and 15+ more through a single local proxy. No certificates, no MITM.
 
+[![npm](https://img.shields.io/npm/v/grouter-auth.svg?color=blue)](https://www.npmjs.com/package/grouter-auth)
+[![license](https://img.shields.io/github/license/GXDEVS/grouter.svg?color=blue)](./LICENSE)
+[![bun](https://img.shields.io/badge/runtime-Bun%20%E2%89%A5%201.0-black)](https://bun.sh)
+[![issues](https://img.shields.io/github/issues/GXDEVS/grouter.svg)](https://github.com/GXDEVS/grouter/issues)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
+
+---
+
+## Table of contents
+
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Providers](#providers)
+- [Commands](#commands)
+- [Per-provider ports](#per-provider-ports)
+- [Dashboard](#dashboard)
+- [How it works](#how-it-works)
+- [Development](#development)
+- [Contributing](#contributing)
+- [Support](#support)
+- [Uninstall](#uninstall)
+- [License](#license)
+
 ---
 
 ## Install
@@ -196,6 +219,145 @@ Visit `http://localhost:3099/dashboard` once the proxy is running.
 - **Auto token refresh** — each adapter owns its refresh logic; GitHub's short-lived copilot token is cached separately in `provider_data`.
 - **Rotation strategies** — `fill-first` (stay on highest-priority until it rate-limits) or `round-robin` (cycle with configurable stickiness).
 - **Zero external services** — everything runs locally, data lives in `~/.grouter/grouter.db` (SQLite).
+
+---
+
+## Development
+
+Want to hack on grouter? Runtime is [Bun](https://bun.sh) only.
+
+```bash
+git clone https://github.com/GXDEVS/grouter.git
+cd grouter
+bun install
+
+bun run dev           # hot-reload, foreground proxy (bun --hot index.ts serve fg)
+bun run start         # foreground proxy, no hot-reload
+bun run build         # embeds logos, bundles to dist/grouter
+bun run deploy        # build + bun link (refresh the globally-linked binary)
+bun test              # Bun test runner
+```
+
+Alternative one-shot setup (installs deps + `bun link` in one step):
+
+```bash
+bash setup.sh
+```
+
+Project layout:
+
+```
+index.ts              # CLI entry — commander wiring
+src/
+├── commands/         # one file per subcommand (add, serve, list, …)
+├── auth/
+│   ├── orchestrator.ts
+│   └── providers/    # one adapter per provider (device_code / auth_code + PKCE / import)
+├── providers/
+│   └── registry.ts   # single source of truth for provider metadata
+├── proxy/            # Bun.serve listeners, upstream builder, translators
+├── rotator/          # account selection + strategies
+├── token/            # OAuth refresh
+├── db/               # SQLite schema + silent migrations
+├── web/              # dashboard + wizard (served as text imports)
+└── update/           # update banner
+scripts/
+└── embed-logos.ts    # prebuild — emits src/web/logos-embedded.ts
+```
+
+See [`CLAUDE.md`](./CLAUDE.md) for the full architecture guide — request flow, provider-registry rules, database migration conventions, and Bun-first runtime defaults.
+
+---
+
+## Contributing
+
+PRs are welcome. The project ships with a skill at `.claude/skills/contribute/` that walks contributors through the full flow if you use Claude Code; the summary below is the same contract.
+
+### 1. Branch naming
+
+```
+<type>/<short-kebab-description>
+```
+
+Lowercase, kebab-case, under 60 chars. Types:
+
+| Prefix | Use for |
+|---|---|
+| `feat/` | new user-visible capability (new provider, CLI command, dashboard view) |
+| `fix/` | bug fix |
+| `hotfix/` | urgent production fix |
+| `refactor/` | internal restructuring, no behavior change |
+| `perf/` | performance improvement |
+| `chore/` | deps, build, tooling |
+| `docs/` | README, CLAUDE.md, comments |
+| `test/` | tests only |
+| `ci/` | `.github/workflows`, release pipelines |
+| `release/` | release prep (e.g. `release/v4.8.0`) |
+
+Examples: `feat/add-zai-provider`, `fix/token-refresh-race`, `perf/sqlite-wal-mode`, `chore/bump-commander`.
+
+### 2. Commits — Conventional Commits
+
+```
+<type>(<scope>): <short imperative description>
+
+<optional body — why, not what>
+
+<optional footer — BREAKING CHANGE: …, Refs: …, Closes #123>
+```
+
+Rules:
+
+- Subject ≤ 72 chars, imperative mood, lowercase after the colon, no trailing period.
+- One logical change per commit — stage explicit files, never `git add -A`.
+- No emojis in subject, body, or footer.
+- No `Co-Authored-By: <AI assistant>` / "Generated with …" footers.
+- Scopes match the directory layout: `auth`, `auth/<provider>`, `proxy`, `proxy/upstream`, `rotator`, `token`, `db`, `providers`, `commands`, `commands/<cmd>`, `web`, `web/dashboard`, `update`, `cli`, `build`.
+
+Commit types: `feat`, `fix`, `refactor`, `perf`, `chore`, `docs`, `style`, `test`, `build`, `ci`, `revert`. Use `wip` only on private branches that will be squashed before merge.
+
+### 3. Adding a new provider
+
+1. Add an entry to `PROVIDERS` in `src/providers/registry.ts` (models, colors, auth type, deprecation flag).
+2. Drop `src/auth/providers/<id>.ts` exporting an `OAuthAdapter` (`device_code` / `auth_code` + optional PKCE / `import_token`).
+3. Register it in `src/auth/providers/index.ts`.
+4. Add any provider-specific upstream quirks to `src/proxy/upstream.ts`.
+5. Drop a PNG at `src/public/logos/<id>.png` — the prebuild step picks it up on the next `bun run build`.
+
+New columns on `accounts` go in the silent-migration `ALTER TABLE` block in `src/db/index.ts`, **not** in the initial `CREATE TABLE` — existing users already have their database.
+
+### 4. Pull request
+
+1. Push: `git push -u origin <branch>`.
+2. Open PR: `gh pr create` (title mirrors the primary commit).
+3. PR body:
+
+   ```markdown
+   ## Summary
+   - what changed, in plain terms
+   - why this approach
+   - anything reviewers should look at first
+
+   ## Test plan
+   - [ ] concrete manual or automated check
+   - [ ] `bun test` passes (or note why it's not relevant)
+   - [ ] `bun run build` succeeds
+   ```
+
+4. Do not force-push to `main`. Do not `--no-verify` commit hooks. Do not amend a commit that was already pushed.
+5. CI must be green before merge.
+
+### Questions first
+
+For non-trivial changes (new provider with odd OAuth flow, schema migration, rotator behavior), **open an issue first** so we can align on the approach before you invest time in the PR.
+
+---
+
+## Support
+
+- **Bugs & feature requests** → [GitHub Issues](https://github.com/GXDEVS/grouter/issues)
+- **Security issues** → do not open a public issue. Email the maintainer or use GitHub's private vulnerability reporting.
+- **Architecture questions** → [`CLAUDE.md`](./CLAUDE.md) covers the request flow, DB schema, and provider-registry contract.
 
 ---
 
