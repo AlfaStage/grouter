@@ -18,6 +18,7 @@ import { listProxyPools, getProxyPoolById, createProxyPool, updateProxyPool, del
 import { getProviderPort, listProviderPorts } from "../db/ports.ts";
 import { listConnectionsByProvider } from "../db/accounts.ts";
 import { fetchAndSaveProviderModels, getModelsForProvider } from "../providers/model-fetcher.ts";
+import { listClientKeys, createClientKey, deleteClientKey, updateClientKey, getClientKey } from "../db/client_keys.ts";
 
 // Pending auth-code callback listeners keyed by session_id
 interface PendingListener {
@@ -516,4 +517,55 @@ export function handleUnlockAll(): Response {
   // Reset backoff and test_status on all accounts
   db().exec(`UPDATE accounts SET backoff_level = 0, test_status = 'unknown', last_error = NULL, error_code = NULL, last_error_at = NULL`);
   return json({ ok: true });
+}
+
+// ── GET /api/client-keys ──────────────────────────────────────────────────────
+export function handleListClientKeys(): Response {
+  return json({ keys: listClientKeys() });
+}
+
+// ── POST /api/client-keys ─────────────────────────────────────────────────────
+export async function handleCreateClientKey(req: Request): Promise<Response> {
+  try {
+    const body = await req.json() as { name: string; allowed_providers?: string[]; token_limit?: number; api_key?: string; expires_at?: string };
+    if (!body.name) return json({ error: "Missing name" }, 400);
+    const key = body.api_key || "grouter-sk-" + crypto.randomUUID().replace(/-/g, "");
+    createClientKey({
+      name: body.name,
+      api_key: key,
+      allowed_providers: body.allowed_providers && body.allowed_providers.length > 0 ? body.allowed_providers : null,
+      token_limit: body.token_limit || 0,
+      expires_at: body.expires_at || null
+    });
+    return json({ ok: true, key });
+  } catch (err) {
+    return json({ error: String(err) }, 500);
+  }
+}
+
+// ── DELETE /api/client-keys/:api_key ──────────────────────────────────────────
+export function handleDeleteClientKey(key: string): Response {
+  deleteClientKey(key);
+  return json({ ok: true });
+}
+
+// ── PATCH /api/client-keys/:api_key ───────────────────────────────────────────
+export async function handleUpdateClientKey(req: Request, key: string): Promise<Response> {
+  try {
+    const body = await req.json() as { name?: string; allowed_providers?: string[]; token_limit?: number; expires_at?: string };
+    if (!body.name) return json({ error: "Missing name" }, 400);
+
+    const k = getClientKey(key);
+    if (!k) return json({ error: "Key not found" }, 404);
+
+    updateClientKey(key, {
+      name: body.name,
+      allowed_providers: body.allowed_providers && body.allowed_providers.length > 0 ? body.allowed_providers : null,
+      token_limit: body.token_limit || 0,
+      expires_at: body.expires_at || null
+    });
+    return json({ ok: true });
+  } catch (err) {
+    return json({ error: String(err) }, 500);
+  }
 }

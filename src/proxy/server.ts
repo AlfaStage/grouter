@@ -13,6 +13,7 @@ import { recordUsage } from "../db/usage.ts";
 import { getProvider, PROVIDERS } from "../providers/registry.ts";
 import { getModelsForProvider } from "../providers/model-fetcher.ts";
 import { getConnectionCountByProvider } from "../db/accounts.ts";
+import { getClientKey, updateClientKeyUsage } from "../db/client_keys.ts";
 import {
   handleStatus,
   handleAuthStart,
@@ -41,6 +42,9 @@ import {
   handleGetProviderModels,
   handleRefreshProviderModels,
   handleProviderConfig,
+  handleListClientKeys,
+  handleCreateClientKey,
+  handleDeleteClientKey,
 } from "../web/api.ts";
 import { getProxyPoolById } from "../db/pools.ts";
 import { listProviderPorts } from "../db/ports.ts";
@@ -74,12 +78,17 @@ const MODELS_TTL = 10 * 60 * 1000;
  * Each model is prefixed: "provider/model-id".
  * Uses DB-stored models when available, otherwise falls back to registry.
  */
-async function fetchModels() {
+async function fetchModels(req?: Request) {
   if ((globalThis as any).__grouterClearModelsCache) {
     modelsCache = null;
     (globalThis as any).__grouterClearModelsCache = false;
   }
-  if (modelsCache && Date.now() - modelsCache.at < MODELS_TTL) return modelsCache.data;
+  
+  let baseData: unknown[] = [];
+  if (modelsCache && Date.now() - modelsCache.at < MODELS_TTL) {
+    baseData = modelsCache.data;
+  } else {
+
 
   const counts = getConnectionCountByProvider();
   const data: unknown[] = [];
@@ -111,11 +120,39 @@ async function fetchModels() {
       owned_by: "qwen",
     }));
     modelsCache = { data: fallback, at: Date.now() };
-    return fallback;
+    baseData = fallback;
+  } else {
+    modelsCache = { data, at: Date.now() };
+    baseData = data;
+  }
+  } // <-- Added brace to close the `if (modelsCache...) { ... } else {` block
+
+  // --- Dynamic Filtering depending on request Client API Key ---
+  if (req) {
+    const authHeader = req.headers.get("Authorization");
+    const requireAuth = getSetting("require_client_auth") === "true";
+    let clientKey = null;
+
+    if (authHeader?.startsWith("Bearer ")) {
+      clientKey = getClientKey(authHeader.slice(7).trim());
+    }
+
+    if (clientKey) {
+      if (clientKey.allowed_providers) {
+        try {
+          const allowed: string[] = JSON.parse(clientKey.allowed_providers);
+          if (allowed.length > 0) {
+            return baseData.filter((m: any) => allowed.includes(m.id.split("/")[0]));
+          }
+        } catch {}
+      }
+    } else if (requireAuth) {
+      // Key is absent or invalid, but auth is required
+      return [];
+    }
   }
 
-  modelsCache = { data, at: Date.now() };
-  return data;
+  return baseData;
 }
 
 // ── Logger ────────────────────────────────────────────────────────────────────
@@ -249,6 +286,15 @@ export function startServer(port: number) {
       },
       "/api/setup-done": {
         POST:    () => handleSetupDone(),
+        OPTIONS: () => new Response(null, { status: 204, headers: corsHeaders() }),
+      },
+      "/api/client-keys": {
+        GET:     () => handleListClientKeys(),
+        POST:    (req: Request) => handleCreateClientKey(req),
+        OPTIONS: () => new Response(null, { status: 204, headers: corsHeaders() }),
+      },
+      "/api/client-keys/:key": {
+        DELETE:  (req: BunRequest) => handleDeleteClientKey(req.params.key!),
         OPTIONS: () => new Response(null, { status: 204, headers: corsHeaders() }),
       },
       "/api/config": {
@@ -399,8 +445,42 @@ async function handleChatCompletions(req: Request, pinnedProvider?: string): Pro
   try { body = await req.json() as Record<string, unknown>; }
   catch { logReq("POST", "/v1/chat/completions", 400, Date.now() - start); return jsonResponse({ error: { message: "Invalid JSON body" } }, 400); }
 
+  const authHeader = req.headers.get("Authorization");
+  const requireAuth = getSetting("require_client_auth") === "true";
+  let clientKey = null;
+
+  if (authHeader?.startsWith("Bearer ")) {
+    clientKey = getClientKey(authHeader.slice(7).trim());
+  }
+
+  if (requireAuth && !clientKey) {
+    logReq("POST", "/v1/chat/completions", 401, Date.now() - start);
+    return jsonResponse({ error: { message: "Unauthorized. Invalid or missing Client API Key.", type: "invalid_request_error", code: 401 } }, 401);
+  }
+
   const rawModel = typeof body.model === "string" ? body.model : null;
   const { provider, model } = parseProviderModel(rawModel, pinnedProvider);
+  
+  if (clientKey) {
+    if (clientKey.token_limit > 0 && clientKey.tokens_used >= clientKey.token_limit) {
+      logReq("POST", "/v1/chat/completions", 429, Date.now() - start, { model: rawModel });
+      return jsonResponse({ error: { message: "Client API Key token limit exceeded.", type: "rate_limit_error", code: 429 } }, 429);
+    }
+    if (clientKey.expires_at && new Date() > new Date(clientKey.expires_at)) {
+      logReq("POST", "/v1/chat/completions", 403, Date.now() - start, { model: rawModel });
+      return jsonResponse({ error: { message: "Client API Key expired.", type: "invalid_request_error", code: 403 } }, 403);
+    }
+    if (clientKey.allowed_providers) {
+      try {
+        const allowed: string[] = JSON.parse(clientKey.allowed_providers);
+        if (allowed.length > 0 && !allowed.includes(provider)) {
+          logReq("POST", "/v1/chat/completions", 403, Date.now() - start, { model: rawModel });
+          return jsonResponse({ error: { message: `Provider '${provider}' is not allowed for this Client API Key.`, type: "invalid_request_error", code: 403 } }, 403);
+        }
+      } catch {}
+    }
+  }
+
   const stream = body.stream === true;
   const excludeIds = new Set<string>();
   let rotations = 0;
@@ -528,7 +608,10 @@ async function handleChatCompletions(req: Request, pinnedProvider?: string): Pro
             ? { prompt: (stateUsage.prompt_tokens as number) ?? 0, completion: (stateUsage.completion_tokens as number) ?? 0, total: (stateUsage.total_tokens as number) ?? 0 }
             : extractUsageFromSSE(tail);
           logReq("POST", "/v1/chat/completions", 200, ms, { model: rawModel, account: label, rotated: rotations, tokens: usage?.total || undefined });
-          if (usage) recordUsage({ account_id: selected.id, model: rawModel ?? "", prompt_tokens: usage.prompt, completion_tokens: usage.completion, total_tokens: usage.total });
+          if (usage) {
+            recordUsage({ account_id: selected.id, model: rawModel ?? "", prompt_tokens: usage.prompt, completion_tokens: usage.completion, total_tokens: usage.total });
+            if (clientKey) updateClientKeyUsage(clientKey.api_key, usage.total);
+          }
         },
       });
       upstreamResp.body!.pipeTo(writable).catch(() => {});
@@ -547,7 +630,10 @@ async function handleChatCompletions(req: Request, pinnedProvider?: string): Pro
     const promptTok     = rawUsage?.prompt_tokens     ?? 0;
     const completionTok = rawUsage?.completion_tokens ?? 0;
     const totalTok      = rawUsage?.total_tokens      ?? (promptTok + completionTok);
-    if (totalTok > 0) recordUsage({ account_id: selected.id, model: rawModel ?? "", prompt_tokens: promptTok, completion_tokens: completionTok, total_tokens: totalTok });
+    if (totalTok > 0) {
+      recordUsage({ account_id: selected.id, model: rawModel ?? "", prompt_tokens: promptTok, completion_tokens: completionTok, total_tokens: totalTok });
+      if (clientKey) updateClientKeyUsage(clientKey.api_key, totalTok);
+    }
     logReq("POST", "/v1/chat/completions", 200, Date.now() - start, { model: rawModel, account: label, rotated: rotations, tokens: totalTok || undefined });
     return jsonResponse(data);
   }
