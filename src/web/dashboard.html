@@ -1561,7 +1561,7 @@ async function loadProviders() {
   } catch {}
 }
 
-function isLogoUrl(logo) { return !!logo && (logo.startsWith('/') || logo.startsWith('http')); }
+function isLogoUrl(logo) { return !!logo && (logo.startsWith('/') || logo.startsWith('http') || logo.startsWith('data:')); }
 
 /** Render the inner bit of a logo (img OR iconify OR initials). fontSize/color only apply to iconify. */
 function renderLogoInner(p, fontSize, color) {
